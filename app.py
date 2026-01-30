@@ -1,8 +1,9 @@
 import os, io, re, zipfile, shutil, tempfile, traceback
 from datetime import datetime
-from PIL import Image, ImageDraw, ImageFont, ImageEnhance
+from PIL import Image, ImageDraw, ImageFont
+import numpy as np
+import cv2
 import streamlit as st
-import base64
 
 # ------------------- PAGE CONFIG -------------------
 st.set_page_config(
@@ -15,6 +16,39 @@ st.set_page_config(
 # ------------------- CUSTOM CSS -------------------
 st.markdown("""
 <style>
+    /* Hide ALL Streamlit branding elements completely */
+    #MainMenu {visibility: hidden !important;}
+    footer {visibility: hidden !important;}
+    .stDeployButton {display: none !important;}
+    header {visibility: hidden !important;}
+
+    /* Specifically target and hide the "Manage Apps" button */
+    [data-testid="collapsedControl"] {display: none !important;}
+    [data-testid="stMainMenu"] {display: none !important;}
+    [data-testid="stSidebarNav"] {display: none !important;}
+
+    /* Hide the hamburger menu and manage app button container */
+    .stApp > header {display: none !important;}
+    div[data-testid="stDecoration"] {display: none !important;}
+    div[data-testid="stStatusWidget"] {display: none !important;}
+
+    /* Additional selectors to ensure everything is hidden */
+    [data-testid="stToolbar"], 
+    [data-testid="stToolbarActions"] {display: none !important;}
+
+    /* Hide any other Streamlit interface elements */
+    iframe[title="Manage app"] {display: none !important;}
+    iframe[title="Report a bug"] {display: none !important;}
+
+    /* Force hide any remaining elements */
+    button[title="Manage app"] {display: none !important;}
+    button[aria-label="Manage app"] {display: none !important;}
+
+    /* Clear any remaining Streamlit padding/margins */
+    .stApp > div:nth-child(1) > div:nth-child(1) > div > div:nth-child(2) > div {display: none !important;}
+    .stApp > div:nth-child(1) > div:nth-child(1) > div > div:nth-child(1) > div {display: none !important;}
+    
+    /* Professional styling */
     .main-header {
         background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
         padding: 2rem;
@@ -51,6 +85,11 @@ st.markdown("""
         border-left: 4px solid #4a90e2;
         font-size: 0.9rem;
     }
+    .stSidebar .sidebar-content {
+        background: linear-gradient(180deg, #f8f9fa 0%, #e9ecef 100%);
+    }
+    
+    /* Professional styling */
     .section-header {
         font-size: 1.1rem;
         font-weight: 600;
@@ -60,30 +99,74 @@ st.markdown("""
         padding-bottom: 0.5rem;
         border-bottom: 2px solid #4a90e2;
     }
-    .download-section {
-        background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
-        padding: 1.5rem;
-        border-radius: 10px;
-        margin: 1rem 0;
-        border: 2px dashed #4a90e2;
+    
+    /* Sidebar show/hide button */
+    .sidebar-toggle {
+        position: fixed;
+        top: 20px;
+        left: 20px;
+        z-index: 1000;
+        background: #4a90e2;
+        color: white;
+        border: none;
+        border-radius: 50%;
+        width: 40px;
+        height: 40px;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        box-shadow: 0 2px 10px rgba(0, 0, 0, 0.2);
     }
-    .status-success {
-        background-color: #d4edda;
-        color: #155724;
-        padding: 10px;
-        border-radius: 5px;
-        margin: 5px 0;
-        border-left: 4px solid #28a745;
+    
+    .sidebar-toggle:hover {
+        background: #357ae8;
+        transform: scale(1.1);
     }
 </style>
 """, unsafe_allow_html=True)
+
+# ------------------- SESSION STATE FOR SIDEBAR -------------------
+if 'sidebar_visible' not in st.session_state:
+    st.session_state.sidebar_visible = True
+
+# ------------------- SIDEBAR TOGGLE BUTTON -------------------
+if not st.session_state.sidebar_visible:
+    st.markdown("""
+    <div class="sidebar-toggle" onclick="document.getElementById('sidebar-toggle-script').click()">
+        ☰
+    </div>
+    <script>
+        // Create hidden button for toggling sidebar
+        const toggleBtn = document.createElement('button');
+        toggleBtn.id = 'sidebar-toggle-script';
+        toggleBtn.style.display = 'none';
+        document.body.appendChild(toggleBtn);
+        
+        toggleBtn.onclick = function() {
+            this.dispatchEvent(new CustomEvent('toggle-sidebar'));
+        };
+    </script>
+    """, unsafe_allow_html=True)
+    
+    # Add JavaScript to handle sidebar toggle
+    st.components.v1.html("""
+    <script>
+        const toggleBtn = document.getElementById('sidebar-toggle-script');
+        toggleBtn.addEventListener('toggle-sidebar', function() {
+            window.parent.postMessage({
+                type: 'streamlit:setComponentValue',
+                value: 'toggle-sidebar'
+            }, '*');
+        });
+    </script>
+    """)
 
 # ------------------- HEADER -------------------
 st.markdown("""
 <div class="main-header">
     <h1>🎓 LFJC PAPER PROCESSING SYSTEM</h1>
     <p>Professional Answer Sheet Processing | Little Flower Junior College, Uppal</p>
-    <p><small>📥 Auto-Download Enabled | ✂️ Strip Cropping | 🔢 Custom Numbering</small></p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -92,104 +175,10 @@ if 'uploaded_files' not in st.session_state:
     st.session_state.uploaded_files = []
 if 'processed_files' not in st.session_state:
     st.session_state.processed_files = []
-if 'sidebar_visible' not in st.session_state:
-    st.session_state.sidebar_visible = True
-if 'last_generated_pdf' not in st.session_state:
-    st.session_state.last_generated_pdf = None
-if 'last_generated_zip' not in st.session_state:
-    st.session_state.last_generated_zip = None
-
-# ------------------- HELPER FUNCTIONS -------------------
-def enhance_image(pil_img):
-    """Enhance image using Pillow"""
-    # Convert to RGB if needed
-    if pil_img.mode != 'RGB':
-        pil_img = pil_img.convert('RGB')
-    
-    # Enhance contrast
-    enhancer = ImageEnhance.Contrast(pil_img)
-    enhanced = enhancer.enhance(1.3)
-    
-    # Enhance sharpness
-    enhancer = ImageEnhance.Sharpness(enhanced)
-    enhanced = enhancer.enhance(1.5)
-    
-    return enhanced
-
-def natural_sort_key(s):
-    return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', s)]
-
-def parse_qnos(qnos_str):
-    q_list = []
-    if not qnos_str:
-        return q_list
-    for part in qnos_str.split(','):
-        part = part.strip()
-        if '-' in part:
-            start, end = map(int, part.split('-'))
-            q_list.extend(range(start, end + 1))
-        elif part:
-            q_list.append(int(part))
-    return q_list
-
-def parse_multi_numbering(input_str):
-    numbering_map = {}
-    if not input_str:
-        return numbering_map
-    for part in input_str.split(','):
-        part = part.strip()
-        if ':' in part:
-            img_range, start_num = part.split(':')
-            try:
-                start_num = int(start_num)
-            except ValueError:
-                continue
-            if '-' in img_range:
-                start_idx, end_idx = map(int, img_range.split('-'))
-                for i, idx in enumerate(range(start_idx, end_idx + 1)):
-                    numbering_map[idx] = start_num + i
-            else:
-                idx = int(img_range)
-                numbering_map[idx] = start_num
-    return numbering_map
-
-def parse_skip_images(skip_str):
-    skip_list = []
-    if not skip_str:
-        return skip_list
-    for part in skip_str.split(','):
-        part = part.strip()
-        if '-' in part:
-            start, end = map(int, part.split('-'))
-            skip_list.extend(range(start, end + 1))
-        elif part:
-            skip_list.append(int(part))
-    return skip_list
-
-def sanitize_filename(name):
-    cleaned_name = re.sub(r'[^\w\s.-]', '_', name)
-    cleaned_name = re.sub(r'\s+', '_', cleaned_name)
-    cleaned_name = cleaned_name.strip('_')
-    if not cleaned_name:
-        return "untitled"
-    return cleaned_name
-
-def load_font_with_size(size):
-    try:
-        # Try to load font, fall back to default
-        return ImageFont.truetype("arial.ttf", size)
-    except:
-        try:
-            # Try system fonts
-            import sys
-            if sys.platform == "win32":
-                return ImageFont.truetype("C:/Windows/Fonts/arial.ttf", size)
-            elif sys.platform == "darwin":
-                return ImageFont.truetype("/Library/Fonts/Arial.ttf", size)
-            else:
-                return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", size)
-        except:
-            return ImageFont.load_default()
+if 'auto_download_pdf' not in st.session_state:
+    st.session_state.auto_download_pdf = None
+if 'auto_download_zip' not in st.session_state:
+    st.session_state.auto_download_zip = None
 
 # ------------------- SIDEBAR -------------------
 if st.session_state.sidebar_visible:
@@ -293,11 +282,6 @@ else:
         <p>Click the ☰ button in the top-left corner to reopen settings.</p>
     </div>
     """, unsafe_allow_html=True)
-    
-    # Add toggle button
-    if st.button("☰ Open Settings"):
-        st.session_state.sidebar_visible = True
-        st.rerun()
 
 # ------------------- MAIN AREA -------------------
 st.markdown("### 📁 UPLOAD ANSWER SHEETS")
@@ -365,7 +349,74 @@ if st.session_state.uploaded_files:
                     st.success(f"✅ Batch {batch_num} removed from processing queue")
                     st.rerun()
 
-# ------------------- PDF GENERATION -------------------
+# ------------------- HELPER FUNCTIONS -------------------
+def enhance_image_opencv(pil_img):
+    img_cv = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+    gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+    denoised = cv2.fastNlMeansDenoising(gray, h=10)
+    thresh = cv2.adaptiveThreshold(denoised, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 29, 17)
+    kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
+    sharpened = cv2.filter2D(thresh, -1, kernel)
+    return Image.fromarray(cv2.cvtColor(sharpened, cv2.COLOR_GRAY2RGB))
+
+def natural_sort_key(s):
+    return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', s)]
+
+def parse_qnos(qnos_str):
+    q_list = []
+    if not qnos_str:
+        return q_list
+    for part in qnos_str.split(','):
+        part = part.strip()
+        if '-' in part:
+            start, end = map(int, part.split('-'))
+            q_list.extend(range(start, end + 1))
+        elif part:
+            q_list.append(int(part))
+    return q_list
+
+def parse_multi_numbering(input_str):
+    numbering_map = {}
+    if not input_str:
+        return numbering_map
+    for part in input_str.split(','):
+        part = part.strip()
+        if ':' in part:
+            img_range, start_num = part.split(':')
+            try:
+                start_num = int(start_num)
+            except ValueError:
+                continue
+            if '-' in img_range:
+                start_idx, end_idx = map(int, img_range.split('-'))
+                for i, idx in enumerate(range(start_idx, end_idx + 1)):
+                    numbering_map[idx] = start_num + i
+            else:
+                idx = int(img_range)
+                numbering_map[idx] = start_num
+    return numbering_map
+
+def parse_skip_images(skip_str):
+    skip_list = []
+    if not skip_str:
+        return skip_list
+    for part in skip_str.split(','):
+        part = part.strip()
+        if '-' in part:
+            start, end = map(int, part.split('-'))
+            skip_list.extend(range(start, end + 1))
+        elif part:
+            skip_list.append(int(part))
+    return skip_list
+
+def sanitize_filename(name):
+    cleaned_name = re.sub(r'[^À-῿Ⰰ-퟿豈-﷏\uFDF0-\uFFFD\w\s.-]', '_', name)
+    cleaned_name = re.sub(r'\s+', '_', cleaned_name)
+    cleaned_name = cleaned_name.strip('_')
+    if not cleaned_name:
+        return "untitled"
+    return cleaned_name
+
 def get_strip_mapping():
     mapping = {}
     if strip_q1:
@@ -379,6 +430,23 @@ def get_strip_mapping():
             mapping[q] = ratio_val3
     return mapping
 
+def load_font_with_size(size):
+    try:
+        font_paths = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+            "arial.ttf",
+        ]
+        for font_path in font_paths:
+            try:
+                return ImageFont.truetype(font_path, size)
+            except:
+                continue
+        return ImageFont.load_default()
+    except:
+        return ImageFont.load_default()
+
+# ------------------- PDF GENERATION -------------------
 def create_pdf(files):
     try:
         A4_WIDTH, A4_HEIGHT = int(8.27 * 300), int(11.69 * 300)
@@ -452,7 +520,7 @@ def create_pdf(files):
             
             try:
                 img = Image.open(io.BytesIO(file_info['bytes'])).convert('RGB')
-                img = enhance_image(img)
+                img = enhance_image_opencv(img)
                 
                 # Scale image based on alignment choice
                 if alignment == "Center":
@@ -543,25 +611,46 @@ def create_pdf(files):
             draw_wm = ImageDraw.Draw(watermark_img)
             
             try:
-                # Simple watermark without rotation for compatibility
-                draw_page = ImageDraw.Draw(page)
-                draw_page.text((A4_WIDTH//4, A4_HEIGHT//2), WATERMARK_TEXT, 
-                             fill=(200, 200, 200, 100), font=watermark_font)
+                bbox = draw_wm.textbbox((0, 0), WATERMARK_TEXT, font=watermark_font)
+                text_width = bbox[2] - bbox[0]
+                text_height = bbox[3] - bbox[1]
+                
+                text_temp = Image.new('RGBA', (text_width, text_height), (0, 0, 0, 0))
+                draw_temp = ImageDraw.Draw(text_temp)
+                draw_temp.text((-bbox[0], -bbox[1]), WATERMARK_TEXT, 
+                             font=watermark_font, fill=(0, 0, 0, WATERMARK_OPACITY))
+                
+                rotated_text = text_temp.rotate(WATERMARK_ANGLE, expand=1)
+                rotated_width, rotated_height = rotated_text.size
+                
+                paste_x = (A4_WIDTH - rotated_width) // 2
+                paste_y = (A4_HEIGHT - rotated_height) // 2
+                
+                page.paste(rotated_text, (paste_x, paste_y), rotated_text)
             except:
-                pass
+                draw_page = ImageDraw.Draw(page)
+                draw_page.text((A4_WIDTH//3, A4_HEIGHT//2), WATERMARK_TEXT, 
+                             fill=(200, 200, 200, 100), font=watermark_font)
 
             if i > 0:
                 try:
                     draw_page_num = ImageDraw.Draw(page)
                     page_number_text = str(i + 1)
-                    draw_page_num.text((A4_WIDTH//2, A4_HEIGHT - 50), page_number_text, 
-                                     fill="black", font=page_number_font)
+                    bbox_pn = draw_page_num.textbbox((0, 0), page_number_text, font=page_number_font)
+                    text_width_pn = bbox_pn[2] - bbox_pn[0]
+                    text_height_pn = bbox_pn[3] - bbox_pn[1]
+                    page_num_x = (A4_WIDTH - text_width_pn) // 2
+                    page_num_y = A4_HEIGHT - BOTTOM_MARGIN + (BOTTOM_MARGIN - text_height_pn) // 2 - 20
+                    draw_page_num.text((page_num_x, page_num_y), page_number_text, 
+                                     font=page_number_font, fill="black")
                 except:
-                    pass
+                    draw_page_num = ImageDraw.Draw(page)
+                    draw_page_num.text((A4_WIDTH//2, A4_HEIGHT - 50), str(i + 1), 
+                                     fill="black", font=page_number_font)
 
         pdf_buffer = io.BytesIO()
         pdf_pages[0].save(pdf_buffer, format='PDF', save_all=True, 
-                         append_images=pdf_pages[1:], resolution=100.0)
+                         append_images=pdf_pages[1:], resolution=300.0)
         pdf_buffer.seek(0)
         
         return pdf_buffer.getvalue()
@@ -596,7 +685,7 @@ def create_zip(files):
             if question_number_to_display:
                 try:
                     img = Image.open(io.BytesIO(file_info['bytes'])).convert('RGB')
-                    img = enhance_image(img)
+                    img = enhance_image_opencv(img)
                     
                     # Apply strip cropping
                     strip_fraction = strip_mapping.get(question_number_to_display)
@@ -634,82 +723,72 @@ def create_zip(files):
         traceback.print_exc()
         return None, 0
 
-# ------------------- AUTO-DOWNLOAD FUNCTIONS -------------------
-def auto_download_files(pdf_data, zip_data, pdf_filename, zip_filename):
-    """Handle automatic downloads"""
-    status_messages = []
+# ------------------- AUTO-DOWNLOAD FUNCTION -------------------
+def trigger_auto_download(file_data, filename, file_type):
+    """Trigger automatic download using JavaScript"""
+    import base64
     
-    # Store in session state for manual download buttons
-    st.session_state.last_generated_pdf = pdf_data
-    st.session_state.last_generated_zip = zip_data
+    b64 = base64.b64encode(file_data).decode()
+    mime_type = "application/pdf" if file_type == "pdf" else "application/zip"
     
-    # Save to local folder (server)
-    try:
-        os.makedirs("processed_files", exist_ok=True)
-        
-        with open(f"processed_files/{pdf_filename}", "wb") as f:
-            f.write(pdf_data)
-        status_messages.append(f"✅ PDF saved to server: processed_files/{pdf_filename}")
-        
-        with open(f"processed_files/{zip_filename}", "wb") as f:
-            f.write(zip_data)
-        status_messages.append(f"✅ ZIP saved to server: processed_files/{zip_filename}")
-        
-    except Exception as e:
-        status_messages.append(f"⚠️ Local save failed: {str(e)}")
+    # Create hidden download link and auto-click it
+    js_code = f"""
+    <script>
+    function downloadFile() {{
+        const link = document.createElement('a');
+        link.href = 'data:{mime_type};base64,{b64}';
+        link.download = '{filename}';
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+    }}
     
-    return status_messages
+    // Trigger download after a short delay
+    setTimeout(downloadFile, 500);
+    </script>
+    """
+    
+    return js_code
 
 # ------------------- GENERATE BUTTONS -------------------
 st.markdown("---")
 st.markdown("### 🚀 PROCESSING OPTIONS")
 
 if st.session_state.uploaded_files:
-    col1, col2, col3 = st.columns(3)
+    col1, col2 = st.columns(2)
     
     with col1:
         if st.button("📄 **GENERATE PDF DOCUMENT**", use_container_width=True, type="primary"):
             if not exam_type or not exam_date:
                 st.error("❌ Please enter exam details in the settings panel!")
                 if not st.session_state.sidebar_visible:
-                    st.info("📝 Click the ☰ button to open settings panel")
+                    st.info("📝 Click the ☰ button in the top-left corner to open settings panel")
             else:
                 with st.spinner(f"🔨 Processing {len(st.session_state.uploaded_files)} images into PDF..."):
                     pdf_data = create_pdf(st.session_state.uploaded_files)
                     
                     if pdf_data:
-                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                        pdf_filename = f"{sanitize_filename(exam_type)}_{sanitize_filename(exam_date)}_processed.pdf"
+                        filename = f"{sanitize_filename(exam_type)}_{sanitize_filename(exam_date)}_processed.pdf"
+                        st.session_state.auto_download_pdf = pdf_data
                         
-                        # Auto-save
-                        status_msgs = auto_download_files(pdf_data, None, pdf_filename, None)
+                        # Show success message
+                        st.success(f"✅ PDF document created successfully!")
+                        st.info("📥 Download will start automatically...")
                         
-                        st.success("✅ PDF document created successfully!")
+                        # Trigger auto-download
+                        js_code = trigger_auto_download(pdf_data, filename, "pdf")
+                        st.components.v1.html(js_code, height=0)
                         
-                        # Show status
-                        for msg in status_msgs:
-                            st.markdown(f'<div class="status-success">{msg}</div>', unsafe_allow_html=True)
-                        
-                        # Download button
-                        st.download_button(
-                            label="📥 **DOWNLOAD PDF DOCUMENT**",
-                            data=pdf_data,
-                            file_name=pdf_filename,
-                            mime="application/pdf",
-                            type="primary",
-                            use_container_width=True,
-                            key="pdf_download_main"
-                        )
-                        
-                        # Auto-click JavaScript
-                        st.markdown("""
-                        <script>
-                        setTimeout(function() {
-                            const btn = document.querySelector('[data-testid="stDownloadButton"] button');
-                            if (btn) btn.click();
-                        }, 500);
-                        </script>
-                        """, unsafe_allow_html=True)
+                        # Keep the original download button as backup (hidden initially)
+                        with st.expander("📋 Click here if download didn't start", expanded=False):
+                            st.download_button(
+                                label="📥 **DOWNLOAD PDF DOCUMENT**",
+                                data=pdf_data,
+                                file_name=filename,
+                                mime="application/pdf",
+                                type="primary",
+                                use_container_width=True
+                            )
                     else:
                         st.error("❌ Failed to create PDF document")
     
@@ -719,132 +798,28 @@ if st.session_state.uploaded_files:
                 zip_data, processed_count = create_zip(st.session_state.uploaded_files)
                 
                 if zip_data:
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    zip_filename = f"{sanitize_filename(exam_type)}_{sanitize_filename(exam_date)}_processed_images.zip"
-                    
-                    # Auto-save
-                    status_msgs = auto_download_files(None, zip_data, None, zip_filename)
+                    filename = f"{sanitize_filename(exam_type)}_{sanitize_filename(exam_date)}_processed_images.zip"
+                    st.session_state.auto_download_zip = zip_data
                     
                     st.success(f"✅ Archive created with {processed_count} processed images!")
+                    st.info("📥 Download will start automatically...")
                     
-                    # Show status
-                    for msg in status_msgs:
-                        if "ZIP" in msg:
-                            st.markdown(f'<div class="status-success">{msg}</div>', unsafe_allow_html=True)
+                    # Trigger auto-download
+                    js_code = trigger_auto_download(zip_data, filename, "zip")
+                    st.components.v1.html(js_code, height=0)
                     
-                    # Download button
-                    st.download_button(
-                        label="📥 **DOWNLOAD IMAGE ARCHIVE**",
-                        data=zip_data,
-                        file_name=zip_filename,
-                        mime="application/zip",
-                        type="secondary",
-                        use_container_width=True,
-                        key="zip_download_main"
-                    )
-                    
-                    # Auto-click JavaScript
-                    st.markdown("""
-                    <script>
-                    setTimeout(function() {
-                        const btn = document.querySelector('[data-testid="stDownloadButton"] button');
-                        if (btn) btn.click();
-                    }, 500);
-                    </script>
-                    """, unsafe_allow_html=True)
+                    # Keep the original download button as backup (hidden initially)
+                    with st.expander("📋 Click here if download didn't start", expanded=False):
+                        st.download_button(
+                            label="📥 **DOWNLOAD IMAGE ARCHIVE**",
+                            data=zip_data,
+                            file_name=filename,
+                            mime="application/zip",
+                            type="secondary",
+                            use_container_width=True
+                        )
                 else:
                     st.error("❌ Failed to create ZIP archive")
-    
-    with col3:
-        if st.button("🔄 **PROCESS ALL & AUTO-DOWNLOAD**", use_container_width=True, type="primary"):
-            if not exam_type or not exam_date:
-                st.error("❌ Please enter exam details!")
-            else:
-                with st.spinner("🔨 Processing all files..."):
-                    # Generate both PDF and ZIP
-                    pdf_data = create_pdf(st.session_state.uploaded_files)
-                    zip_data, processed_count = create_zip(st.session_state.uploaded_files)
-                    
-                    if pdf_data and zip_data:
-                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                        pdf_filename = f"{sanitize_filename(exam_type)}_{sanitize_filename(exam_date)}_{timestamp}.pdf"
-                        zip_filename = f"{sanitize_filename(exam_type)}_{sanitize_filename(exam_date)}_{timestamp}_images.zip"
-                        
-                        # Auto-save
-                        status_msgs = auto_download_files(pdf_data, zip_data, pdf_filename, zip_filename)
-                        
-                        st.success("✅ All files processed successfully!")
-                        
-                        # Show status
-                        for msg in status_msgs:
-                            st.markdown(f'<div class="status-success">{msg}</div>', unsafe_allow_html=True)
-                        
-                        # Create download section
-                        st.markdown('<div class="download-section">', unsafe_allow_html=True)
-                        st.markdown("### 📥 DOWNLOAD FILES")
-                        
-                        col_d1, col_d2 = st.columns(2)
-                        with col_d1:
-                            st.download_button(
-                                "📄 DOWNLOAD PDF",
-                                pdf_data,
-                                pdf_filename,
-                                "application/pdf",
-                                use_container_width=True,
-                                key="pdf_final"
-                            )
-                        with col_d2:
-                            st.download_button(
-                                "🗃️ DOWNLOAD ZIP",
-                                zip_data,
-                                zip_filename,
-                                "application/zip",
-                                use_container_width=True,
-                                key="zip_final"
-                            )
-                        st.markdown('</div>', unsafe_allow_html=True)
-                        
-                        # Auto-click both buttons
-                        st.markdown("""
-                        <script>
-                        setTimeout(function() {
-                            const buttons = document.querySelectorAll('[data-testid="stDownloadButton"] button');
-                            buttons.forEach(btn => {
-                                setTimeout(() => btn.click(), 100);
-                            });
-                        }, 800);
-                        </script>
-                        """, unsafe_allow_html=True)
-                        
-                    else:
-                        st.error("❌ Failed to create files")
-    
-    # Manual download section for previous files
-    if st.session_state.last_generated_pdf or st.session_state.last_generated_zip:
-        st.markdown("---")
-        st.markdown("### 🔄 PREVIOUS FILES")
-        
-        col_prev1, col_prev2 = st.columns(2)
-        
-        with col_prev1:
-            if st.session_state.last_generated_pdf:
-                st.download_button(
-                    "📄 DOWNLOAD PREVIOUS PDF",
-                    st.session_state.last_generated_pdf,
-                    f"LFJC_Backup_{datetime.now().strftime('%Y%m%d')}.pdf",
-                    "application/pdf",
-                    use_container_width=True
-                )
-        
-        with col_prev2:
-            if st.session_state.last_generated_zip:
-                st.download_button(
-                    "🗃️ DOWNLOAD PREVIOUS ZIP",
-                    st.session_state.last_generated_zip,
-                    f"LFJC_Backup_{datetime.now().strftime('%Y%m%d')}.zip",
-                    "application/zip",
-                    use_container_width=True
-                )
 else:
     st.info("📤 Upload answer sheet images and add them to the processing queue to begin")
 
@@ -852,6 +827,19 @@ else:
 st.markdown("---")
 st.markdown("""
 <div style='text-align: center; color: #666; padding: 1.5rem; font-size: 0.9rem;'>
-    © All Rights Reserved, LFJC 2024 .
+    ©  All Rights Reserved, LFJC 2026 .
 </div>
 """, unsafe_allow_html=True)
+
+# JavaScript for sidebar toggle
+st.components.v1.html("""
+<script>
+    // Listen for messages to toggle sidebar
+    window.addEventListener('message', function(event) {
+        if (event.data.type === 'streamlit:setComponentValue' && event.data.value === 'toggle-sidebar') {
+            // This will trigger a rerun when sidebar needs to be shown
+            window.location.reload();
+        }
+    });
+</script>
+""", height=0)
